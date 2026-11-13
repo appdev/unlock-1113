@@ -1,0 +1,284 @@
+name: Desktop
+on:
+  workflow_dispatch:
+    inputs:
+      publish:
+        description: Also upload to the draft GitHub Release
+        type: boolean
+        default: false
+
+env:
+  VERSION: v3.8.9
+  PACKAGE_MANAGER: pnpm@12.6.0
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ${{ matrix.config.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        config:
+          - os: ubuntu-22.04
+            kernel_path: "../app/kernel-linux/SiYuan-Kernel"
+            build_mode: "-buildmode=pie"
+            build_args: "-s -w -extldflags -static-pie -X github.com/siyuan-note/siyuan/kernel/util.Mode=prod"
+            electron_args: "dist-linux"
+            goos: "linux"
+            goarch: "amd64"
+            cc_path: "x86_64-linux-musl-cross/bin/x86_64-linux-musl-gcc"
+            suffix: "linux.tar.gz"
+            deb_suffix: "linux.deb"
+          - os: ubuntu-22.04
+            name: ubuntu build linux.AppImage
+            kernel_path: "../app/kernel-linux/SiYuan-Kernel"
+            build_mode: "-buildmode=pie"
+            build_args: "-s -w -extldflags -static-pie -X github.com/siyuan-note/siyuan/kernel/util.Mode=prod"
+            electron_args: "dist-linux"
+            goos: "linux"
+            goarch: "amd64"
+            cc_path: "x86_64-linux-musl-cross/bin/x86_64-linux-musl-gcc"
+            suffix: "linux.AppImage"
+            deb_suffix: ""
+          - os: ubuntu-22.04
+            kernel_path: "../app/kernel-linux-arm64/SiYuan-Kernel"
+            build_mode: "-buildmode=pie"
+            build_args: "-s -w -extldflags -static-pie -X github.com/siyuan-note/siyuan/kernel/util.Mode=prod"
+            electron_args: "dist-linux-arm64"
+            goos: "linux"
+            goarch: "arm64"
+            cc_path: "aarch64-linux-musl-cross/bin/aarch64-linux-musl-gcc"
+            suffix: "linux-arm64.tar.gz"
+            deb_suffix: "linux-arm64.deb"
+          - os: macos-15-intel
+            kernel_path: "../app/kernel-darwin/SiYuan-Kernel"
+            build_mode: ""
+            build_args: "-s -w -X github.com/siyuan-note/siyuan/kernel/util.Mode=prod"
+            electron_args: "dist-darwin"
+            goos: "darwin"
+            goarch: "amd64"
+            suffix: "mac.dmg"
+            deb_suffix: ""
+          - os: macos-latest
+            kernel_path: "../app/kernel-darwin-arm64/SiYuan-Kernel"
+            build_mode: ""
+            build_args: "-s -w -X github.com/siyuan-note/siyuan/kernel/util.Mode=prod"
+            electron_args: "dist-darwin-arm64"
+            goos: "darwin"
+            goarch: "arm64"
+            suffix: "mac-arm64.dmg"
+            deb_suffix: ""
+          - os: windows-latest
+            kernel_path: "../app/kernel/SiYuan-Kernel.exe"
+            build_mode: ""
+            build_args: "-s -w -H=windowsgui -X github.com/siyuan-note/siyuan/kernel/util.Mode=prod"
+            electron_args: "dist"
+            goos: "windows"
+            gobin: "bin"
+            mingwsys: "MINGW64"
+            goarch: "amd64"
+            suffix: "win.exe"
+            deb_suffix: ""
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: siyuan-note
+          persist-credentials: false
+
+      - name: Prepare upstream source
+        shell: bash
+        working-directory: ${{ github.workspace }}/siyuan-note
+        run: |
+          mkdir -p ../go
+          bash scripts/prepare-source.sh siyuan
+
+      - name: Set up Cross Compilation Toolchains for Linux
+        if: contains( matrix.config.goos, 'linux')
+        run: |
+          sudo mkdir -p /usr/local/musl
+
+          if [ "${{ matrix.config.goarch }}" = "amd64" ]; then
+            wget https://github.com/appdev/musl-archive/releases/download/latest/x86_64-linux-musl-cross.tgz
+            sudo tar -xzf x86_64-linux-musl-cross.tgz -C /usr/local/musl
+          elif [ "${{ matrix.config.goarch }}" = "arm64" ]; then
+            sudo apt-get update
+            sudo apt-get install -y --no-install-recommends gcc-aarch64-linux-gnu libc6-dev-arm64-cross
+            wget https://github.com/appdev/musl-archive/releases/download/latest/aarch64-linux-musl-cross.tgz
+            sudo tar -xzf aarch64-linux-musl-cross.tgz -C /usr/local/musl
+          fi
+
+      - name: Set up MingGW
+        uses: msys2/setup-msys2@v2
+        if: contains( matrix.config.goos, 'windows')
+        with:
+          install: p7zip mingw-w64-x86_64-lua
+
+      - name: Set up TDM-GCC
+        run: msys2 -c "bash siyuan-note/siyuan/scripts/get-tdm-gcc.sh tdm https://github.com/jmeubank/tdm-gcc/releases/download/v10.3.0-tdm-1/tdm-gcc-10.3.0.exe" && echo "CC=${{ github.workspace }}/tdm/bin/gcc.exe" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+        if: contains( matrix.config.goarch, '386')
+        working-directory: ${{ github.workspace }}
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: ${{ github.workspace }}/siyuan-note/siyuan/kernel/go.mod
+          cache-dependency-path: "**/*.sum"
+      - run: go version
+
+      - name: Set up goversioninfo
+        run: go get github.com/josephspurrier/goversioninfo/cmd/goversioninfo && go install github.com/josephspurrier/goversioninfo/cmd/goversioninfo
+        if: contains( matrix.config.goos, 'windows')
+        working-directory: ${{ github.workspace }}/siyuan-note/siyuan/kernel
+        env:
+          GO111MODULE: on
+          CGO_ENABLED: 1
+          GOOS: ${{ matrix.config.goos }}
+          GOPATH: ${{ github.workspace }}/go
+          GOARCH: ${{ matrix.config.goarch }}
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 24
+
+      - name: Install Node pnpm
+        run: npm install -g ${{ env.PACKAGE_MANAGER }}
+        working-directory: ${{ github.workspace }}/siyuan-note/siyuan/app
+
+      - name: Configure optional managed storage
+        working-directory: ${{ github.workspace }}/siyuan-note
+        env:
+          SIYUAN_MANAGED_STORAGE_ORIGIN: ${{ vars.SIYUAN_MANAGED_STORAGE_ORIGIN }}
+        run: node scripts/configure-managed-storage.mjs siyuan
+
+      - name: Verify account-free sync
+        shell: bash
+        working-directory: ${{ github.workspace }}/siyuan-note
+        run: bash scripts/check-account-free.sh siyuan
+
+      - name: Install Node Dependencies
+        run: pnpm install --no-frozen-lockfile
+        working-directory: ${{ github.workspace }}/siyuan-note/siyuan/app
+
+      - name: Building UI
+        run: pnpm run build
+        working-directory: ${{ github.workspace }}/siyuan-note/siyuan/app
+
+      - name: Generate Icon Resource and Properties/Version Info For Windows
+        run: ${{ github.workspace }}\go\${{ matrix.config.gobin }}\goversioninfo -platform-specific=true -icon="resource\icon.ico" -manifest="resource\goversioninfo.exe.manifest"
+        if: contains( matrix.config.goos, 'windows')
+        working-directory: ${{ github.workspace }}/siyuan-note/siyuan/kernel
+
+      - name: Clean Build Directories
+        if: contains( matrix.config.goos, 'linux')
+        run: |
+          rm -rf app/build
+          rm -rf app/kernel-linux
+          rm -rf app/kernel-linux-arm64
+        working-directory: ${{ github.workspace }}/siyuan-note/siyuan
+
+      - name: Building Kernel
+        run: go build ${{ matrix.config.build_mode }} --tags "fts5 sqlcipher" -o "${{ matrix.config.kernel_path }}" -v -ldflags "${{ matrix.config.build_args }}"
+        working-directory: ${{ github.workspace }}/siyuan-note/siyuan/kernel
+        env:
+          GO111MODULE: on
+          CGO_ENABLED: 1
+          GOOS: ${{ matrix.config.goos }}
+          GOPATH: ${{ github.workspace }}/go
+          GOARCH: ${{ matrix.config.goarch }}
+          GOPROXY: https://proxy.golang.org,direct
+          CC: ${{ runner.os == 'Linux' && format('/usr/local/musl/{0}', matrix.config.cc_path) || '' }}
+
+      - name: Verify Linux kernel is static PIE
+        if: contains(matrix.config.goos, 'linux')
+        shell: bash
+        working-directory: ${{ github.workspace }}/siyuan-note/siyuan/kernel
+        run: |
+          set -euo pipefail
+          kernel_path="${{ matrix.config.kernel_path }}"
+          file "${kernel_path}"
+          build_info="$(go version -m "${kernel_path}")"
+          program_headers="$(readelf -lW "${kernel_path}")"
+          dynamic_section="$(readelf -dW "${kernel_path}" 2>/dev/null || true)"
+          printf '%s\n' "${build_info}"
+          printf '%s\n' "${program_headers}"
+          printf '%s\n' "${dynamic_section}"
+
+          if grep -Fq ' INTERP ' <<<"${program_headers}"; then
+            echo "::error::Linux kernel contains an ELF interpreter"
+            exit 1
+          fi
+          if grep -Fq '(NEEDED)' <<<"${dynamic_section}"; then
+            echo "::error::Linux kernel contains dynamic dependencies"
+            exit 1
+          fi
+          grep -F $'build\t-buildmode=pie' <<<"${build_info}"
+          grep -F -- '-extldflags -static-pie' <<<"${build_info}"
+
+      - name: Building Electron
+        shell: bash
+        working-directory: ${{ github.workspace }}/siyuan-note/siyuan/app
+        env:
+          ELECTRON_TASK: ${{ matrix.config.electron_args }}
+          TARGET_OS: ${{ matrix.config.goos }}
+          TARGET_ARCH: ${{ matrix.config.goarch }}
+          CSC_IDENTITY_AUTO_DISCOVERY: "false"
+        run: |
+          set -euo pipefail
+          if [[ "$TARGET_OS" == darwin ]]; then
+            config=electron-builder-darwin.yml
+            if [[ "$TARGET_ARCH" == arm64 ]]; then
+              config=electron-builder-darwin-arm64.yml
+            fi
+            cat > electron-builder-unlock.yml <<EOF
+          extends: ./$config
+          mac:
+            identity: "-"
+            provisioningProfile: null
+            entitlements: null
+            entitlementsInherit: null
+            notarize: false
+          EOF
+            arch=x64
+            if [[ "$TARGET_ARCH" == arm64 ]]; then
+              arch=arm64
+            fi
+            pnpm exec electron-builder --mac "--$arch" --config electron-builder-unlock.yml --publish=never
+          else
+            pnpm run "$ELECTRON_TASK"
+          fi
+
+      - name: Upload desktop artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: unlock-1113-${{ env.VERSION }}-${{ matrix.config.suffix }}
+          path: |
+            siyuan-note/siyuan/app/build/siyuan-*-${{ matrix.config.suffix }}
+            siyuan-note/siyuan/app/build/siyuan-*-${{ matrix.config.deb_suffix }}
+          if-no-files-found: error
+
+  publish:
+    if: inputs.publish
+    needs: build
+    runs-on: ubuntu-24.04
+    concurrency: unlock-1113-draft-release
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: unlock-1113-*
+          path: artifacts
+          merge-multiple: true
+      - name: Update draft release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: bash scripts/upload-draft-release.sh "$VERSION" artifacts/*

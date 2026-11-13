@@ -1,0 +1,7 @@
+.codex/
+dist/
+/siyuan/
+/siyuan-android/
+/siyuan-ios/
+node_modules/
+.DS_Store

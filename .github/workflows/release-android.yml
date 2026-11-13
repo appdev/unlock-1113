@@ -1,0 +1,203 @@
+name: release-android
+
+on:
+  workflow_dispatch:
+    inputs:
+      publish:
+        description: Also upload to the draft GitHub Release
+        type: boolean
+        default: false
+
+env:
+  VERSION: v3.8.9
+  PACKAGE_MANAGER: pnpm@12.6.0
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ${{ matrix.config.os }}
+    strategy:
+      matrix:
+        config:
+          - os: ubuntu-22.04
+            kernel_path: "../../../siyuan-android/app/libs/kernel.aar"
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: siyuan-note
+          persist-credentials: false
+
+      - name: Prepare upstream source
+        shell: bash
+        working-directory: ${{ github.workspace }}/siyuan-note
+        run: |
+          set -euo pipefail
+          mkdir -p ../go
+          bash scripts/prepare-source.sh siyuan
+
+          git clone --branch "$VERSION" --depth=1 https://github.com/siyuan-note/siyuan-android.git
+          cd siyuan-android
+          test "$(git rev-parse HEAD)" = 9adea3ae243ea18c5a9c83ac1ed2394f582f643a
+
+          git apply --ignore-whitespace --verbose ${{ github.workspace }}/siyuan-note/patches/siyuan-android/debug-build.patch
+          git apply --ignore-whitespace --verbose ${{ github.workspace }}/siyuan-note/patches/siyuan-android/dual-package.patch
+
+          mkdir -p app/src/main/assets/
+          mkdir -p app/libs/
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: ${{ github.workspace }}/siyuan-note/siyuan/kernel/go.mod
+          cache-dependency-path: "**/*.sum"
+      - run: go version
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 24
+
+      - name: Install Node pnpm
+        run: npm install -g ${{ env.PACKAGE_MANAGER }}
+        working-directory: ${{ github.workspace }}/siyuan-note/siyuan/app
+
+      - name: Configure optional managed storage
+        working-directory: ${{ github.workspace }}/siyuan-note
+        env:
+          SIYUAN_MANAGED_STORAGE_ORIGIN: ${{ vars.SIYUAN_MANAGED_STORAGE_ORIGIN }}
+        run: node scripts/configure-managed-storage.mjs siyuan
+
+      - name: Verify account-free sync
+        shell: bash
+        working-directory: ${{ github.workspace }}/siyuan-note
+        run: bash scripts/check-account-free.sh siyuan
+
+      - name: Install Node Dependencies
+        run: pnpm install --no-frozen-lockfile
+        working-directory: ${{ github.workspace }}/siyuan-note/siyuan/app
+
+      - name: Building UI
+        run: pnpm run build
+        working-directory: ${{ github.workspace }}/siyuan-note/siyuan/app
+
+      - name: gomobile
+        working-directory: ${{ github.workspace }}/go
+        run: |
+          go install golang.org/x/mobile/cmd/gomobile@latest
+          gomobile init
+
+      - name: Set up java
+        uses: actions/setup-java@v4
+        with:
+          distribution: "temurin"
+          java-version: "17"
+          cache: "gradle"
+          cache-dependency-path: siyuan-note/siyuan-android/**/*.gradle*
+
+      - name: Building Android Kernel
+        run: |
+          gomobile bind --tags "fts5 sqlcipher" -androidapi 21 -target='android/arm64' -ldflags '-s -w' -v -o "${{ matrix.config.kernel_path }}" ./
+          ls -la "${{ matrix.config.kernel_path }}"
+        working-directory: ${{ github.workspace }}/siyuan-note/siyuan/kernel/mobile
+        env:
+          GO111MODULE: on
+          CGO_ENABLED: 1
+
+      - name: android assets
+        working-directory: ${{ github.workspace }}/siyuan-note/siyuan/app/
+        run: |
+          zip -r ${{ github.workspace }}/siyuan-note/siyuan-android/app/src/main/assets/app.zip ./appearance ./guide ./stage ./changelogs
+
+      - name: Decode Keystore
+        id: decode_keystore
+        uses: timheuer/base64-to-file@v1.2
+        with:
+          fileName: "siyuan.jks"
+          fileDir: ${{ github.workspace }}/siyuan-note/siyuan-android/keystore
+          encodedString: ${{ secrets.KEYSTORE }}
+
+      - name: Building Android
+        working-directory: ${{ github.workspace }}/siyuan-note/siyuan-android
+        run: |
+          test -n "$KEYSTORE_PASSWORD"
+          chmod +x ./gradlew
+          ./gradlew :app:assembleGoogleplayRelease :app:assembleAppdevRelease
+        env:
+          KEYSTORE_PASSWORD: ${{ secrets.KEYSTORE_PASSWORD }}
+
+      - name: Verify Android package IDs and shortcuts
+        working-directory: ${{ github.workspace }}/siyuan-note/siyuan-android
+        run: |
+          original_apk=$(find app/build/outputs/apk/googleplay/release -maxdepth 1 -type f -name 'siyuan-*.apk' -print -quit)
+          appdev_apk=$(find app/build/outputs/apk/appdev/release -maxdepth 1 -type f -name 'siyuan-*.apk' -print -quit)
+          aapt=$(find "${ANDROID_HOME}/build-tools" -type f -name aapt -print | sort -V | tail -n 1)
+
+          test -n "${original_apk}" && test -n "${appdev_apk}" && test -n "${aapt}"
+          "${aapt}" dump badging "${original_apk}" | grep -Fq "package: name='org.b3log.siyuan'"
+          "${aapt}" dump badging "${appdev_apk}" | grep -Fq "package: name='com.appdev.siyuan'"
+
+          check_shortcut() {
+            local apk="$1" expected_package="$2" shortcut_path shortcut_dump
+            shortcut_path=$("${aapt}" dump --values resources "${apk}" | awk '
+              /^[[:space:]]*resource .*:xml\/shortcuts:/ {
+                getline
+                if ($1 == "(string8)") {
+                  gsub(/"/, "", $2)
+                  print $2
+                  exit
+                }
+              }')
+            test -n "${shortcut_path}"
+            shortcut_dump=$("${aapt}" dump xmltree "${apk}" "${shortcut_path}")
+            # Shortcut intents require literal strings, not resource references.
+            printf '%s\n' "${shortcut_dump}" | grep -Fq "android:targetPackage(0x01010021)=\"${expected_package}\""
+            printf '%s\n' "${shortcut_dump}" | grep -Fq 'android:targetClass(0x0101002f)="org.b3log.siyuan.ShortcutActivity"'
+            printf '%s\n' "${shortcut_dump}" | grep -Fq 'android:action(0x0101002d)="android.intent.action.VIEW"'
+            printf '%s\n' "${shortcut_dump}" | grep -Fq 'android:data(0x0101002e)="shorthand"'
+            echo "Verified shortcut: ${expected_package} -> org.b3log.siyuan.ShortcutActivity"
+          }
+
+          check_shortcut "${original_apk}" org.b3log.siyuan
+          check_shortcut "${appdev_apk}" com.appdev.siyuan
+
+      - name: Collect Android APKs
+        shell: bash
+        working-directory: ${{ github.workspace }}/siyuan-note/siyuan-android
+        run: |
+          set -euo pipefail
+          mkdir -p release-artifacts
+          cp app/build/outputs/apk/googleplay/release/siyuan-*.apk "release-artifacts/unlock-1113-$VERSION-android-arm64.apk"
+          cp app/build/outputs/apk/appdev/release/siyuan-*.apk "release-artifacts/unlock-1113-$VERSION-android-arm64-appdev.apk"
+
+      - name: Upload Android artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: unlock-1113-${{ env.VERSION }}-android
+          path: siyuan-note/siyuan-android/release-artifacts/*.apk
+          if-no-files-found: error
+
+  publish:
+    if: inputs.publish
+    needs: build
+    runs-on: ubuntu-24.04
+    concurrency: unlock-1113-draft-release
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: unlock-1113-*
+          path: artifacts
+          merge-multiple: true
+      - name: Update draft release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: bash scripts/upload-draft-release.sh "$VERSION" artifacts/*

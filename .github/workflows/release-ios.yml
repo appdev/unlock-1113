@@ -1,0 +1,166 @@
+name: release-ios
+
+on:
+  workflow_dispatch:
+    inputs:
+      publish:
+        description: Also upload to the draft GitHub Release
+        type: boolean
+        default: false
+
+env:
+  VERSION: v3.8.9
+  PACKAGE_MANAGER: pnpm@12.6.0
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ${{ matrix.config.os }}
+    env:
+      # Keep the Go build cache in the workspace temp dir so it can be cached
+      # and shared with other macOS workflows on the same OS/arch/toolchain.
+      GOCACHE: ${{ github.workspace }}/.gocache
+    strategy:
+      matrix:
+        config:
+          - os: macos-latest
+            kernel_path: "../ios/iosk.xcframework"
+            # Device arm64 only: the Xcode build below targets -sdk iphoneos.
+            target: "ios/arm64"
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: siyuan-note
+          persist-credentials: false
+
+      - name: Prepare upstream source
+        shell: bash
+        working-directory: ${{ github.workspace }}/siyuan-note
+        run: |
+          set -euo pipefail
+          mkdir -p ../go
+          bash scripts/prepare-source.sh siyuan
+
+          git clone https://github.com/siyuan-note/siyuan-ios.git
+          cd siyuan-ios
+          # Pin the iOS shell to the v3.8.8 window so release builds are reproducible.
+          git checkout 05280f32ba89705e3ba55c233037db02c93cdea8
+          # Keep iOS 15 support: @available is illegal on lazy stored properties.
+          git apply "${{ github.workspace }}/siyuan-note/patches/siyuan-ios/text-menu-availability.patch"
+
+          # https://github.com/siyuan-note/siyuan-ios/commit/d72cd11a6d78df88b56a2850f0f46c2b905a5433
+          # ASSETCATALOG_COMPILER_APPICON_NAME = logo;
+          # 但代码里只有 AppIcon.appiconset，先复制一份看看后续会不会修复
+          cp -r siyuan-ios/Assets.xcassets/AppIcon.appiconset siyuan-ios/Assets.xcassets/logo.appiconset
+
+          sed -i '' 's/MARKETING_VERSION =\(.*\)/MARKETING_VERSION = ${{ env.VERSION }};/g' siyuan-ios.xcodeproj/project.pbxproj
+          sed -i '' 's/PRODUCT_BUNDLE_IDENTIFIER =\(.*\)/PRODUCT_BUNDLE_IDENTIFIER = com.ld246.siyuan.debug;/g' siyuan-ios.xcodeproj/project.pbxproj
+          git status
+          git diff
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: ${{ github.workspace }}/siyuan-note/siyuan/kernel/go.mod
+          cache-dependency-path: "**/*.sum"
+      - run: go version
+
+      - name: Cache Go build output
+        uses: actions/cache@v4
+        with:
+          path: ${{ github.workspace }}/.gocache
+          # Repository-scoped: any workflow using the same key and path can restore it.
+          key: go-build-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('**/go.sum') }}
+          restore-keys: |
+            go-build-${{ runner.os }}-${{ runner.arch }}-
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 24
+
+      - name: Install Node pnpm
+        run: npm install -g ${{ env.PACKAGE_MANAGER }}
+        working-directory: ${{ github.workspace }}/siyuan-note/siyuan/app
+
+      - name: Configure optional managed storage
+        working-directory: ${{ github.workspace }}/siyuan-note
+        env:
+          SIYUAN_MANAGED_STORAGE_ORIGIN: ${{ vars.SIYUAN_MANAGED_STORAGE_ORIGIN }}
+        run: node scripts/configure-managed-storage.mjs siyuan
+
+      - name: Verify account-free sync
+        shell: bash
+        working-directory: ${{ github.workspace }}/siyuan-note
+        run: bash scripts/check-account-free.sh siyuan
+
+      - name: Install Node Dependencies
+        run: pnpm install --no-frozen-lockfile
+        working-directory: ${{ github.workspace }}/siyuan-note/siyuan/app
+
+      - name: Building UI
+        run: pnpm run build
+        working-directory: ${{ github.workspace }}/siyuan-note/siyuan/app
+
+      - name: gomobile
+        working-directory: ${{ github.workspace }}/go
+        run: |
+          go install golang.org/x/mobile/cmd/gomobile@latest
+          gomobile init
+
+      - name: Building ios Kernel
+        run: |
+          gomobile bind --tags "fts5 sqlcipher" -ldflags '-s -w' -v -target=${{ matrix.config.target }} -o "${{ matrix.config.kernel_path }}" ./
+        working-directory: ${{ github.workspace }}/siyuan-note/siyuan/kernel/mobile
+        env:
+          GO111MODULE: on
+          CGO_ENABLED: 1
+
+      - name: ios assets
+        working-directory: ${{ github.workspace }}/siyuan-note/siyuan/app/
+        run: |
+          mkdir -p ${{ github.workspace }}/siyuan-note/siyuan-ios/app/
+          cp -r ./appearance ./guide ./stage ./changelogs ${{ github.workspace }}/siyuan-note/siyuan-ios/app/
+
+      - name: Building iOS
+        working-directory: ${{ github.workspace }}/siyuan-note/siyuan-ios
+        run: |
+          mkdir -p ../siyuan-ios-out/Payload
+          xcodebuild -workspace ./siyuan-ios.xcodeproj/project.xcworkspace -scheme siyuan-ios -sdk iphoneos -configuration Release CODE_SIGN_IDENTITY="" CODE_SIGNING_REQUIRED=NO -derivedDataPath ../siyuan-ios-out
+          mv ../siyuan-ios-out/Build/Products/Release-iphoneos/siyuan-ios.app ../siyuan-ios-out/Payload
+          cd ../siyuan-ios-out
+          zip -r Payload.zip Payload
+          mv Payload.zip "unlock-1113-$VERSION-ios.ipa"
+
+      - name: Upload iOS artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: unlock-1113-${{ env.VERSION }}-ios
+          path: siyuan-note/siyuan-ios-out/unlock-1113-*.ipa
+          if-no-files-found: error
+
+  publish:
+    if: inputs.publish
+    needs: build
+    runs-on: ubuntu-24.04
+    concurrency: unlock-1113-draft-release
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: unlock-1113-*
+          path: artifacts
+          merge-multiple: true
+      - name: Update draft release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: bash scripts/upload-draft-release.sh "$VERSION" artifacts/*
