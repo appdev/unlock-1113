@@ -31,7 +31,7 @@ index a1c406b..deb7ee8 100644
          release {
              // 正式版打包时指定签名证书
 -            signingConfig = signingConfigs.siyuanConfig
-+            signingConfig = signingConfigs.release
++            signingConfig = System.getenv("KEYSTORE_PASSWORD") ? signingConfigs.release : null
  
              minifyEnabled = true
              shrinkResources = true

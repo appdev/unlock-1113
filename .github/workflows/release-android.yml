@@ -25,6 +25,25 @@ jobs:
             kernel_path: "../../../siyuan-android/app/libs/kernel.aar"
 
     steps:
+      - name: Check Android signing configuration
+        id: signing
+        shell: bash
+        env:
+          KEYSTORE: ${{ secrets.KEYSTORE }}
+          KEYSTORE_PASSWORD: ${{ secrets.KEYSTORE_PASSWORD }}
+          PUBLISH: ${{ inputs.publish }}
+        run: |
+          set -euo pipefail
+          if [[ -n "$KEYSTORE" && -n "$KEYSTORE_PASSWORD" ]]; then
+            echo "signed=true" >> "$GITHUB_OUTPUT"
+          elif [[ -n "$KEYSTORE" || -n "$KEYSTORE_PASSWORD" || "$PUBLISH" == true ]]; then
+            echo "::error::Configure both KEYSTORE and KEYSTORE_PASSWORD to sign or publish Android APKs."
+            exit 1
+          else
+            echo "signed=false" >> "$GITHUB_OUTPUT"
+            echo "Android build will produce unsigned APKs."
+          fi
+
       - uses: actions/checkout@v4
         with:
           path: siyuan-note
@@ -112,6 +131,7 @@ jobs:
           zip -r ${{ github.workspace }}/siyuan-note/siyuan-android/app/src/main/assets/app.zip ./appearance ./guide ./stage ./changelogs
 
       - name: Decode Keystore
+        if: steps.signing.outputs.signed == 'true'
         id: decode_keystore
         uses: timheuer/base64-to-file@v1.2
         with:
@@ -122,7 +142,6 @@ jobs:
       - name: Building Android
         working-directory: ${{ github.workspace }}/siyuan-note/siyuan-android
         run: |
-          test -n "$KEYSTORE_PASSWORD"
           chmod +x ./gradlew
           ./gradlew :app:assembleGoogleplayRelease :app:assembleAppdevRelease
         env:
@@ -166,11 +185,17 @@ jobs:
       - name: Collect Android APKs
         shell: bash
         working-directory: ${{ github.workspace }}/siyuan-note/siyuan-android
+        env:
+          SIGNED: ${{ steps.signing.outputs.signed }}
         run: |
           set -euo pipefail
+          suffix=""
+          if [[ "$SIGNED" == false ]]; then
+            suffix=-unsigned
+          fi
           mkdir -p release-artifacts
-          cp app/build/outputs/apk/googleplay/release/siyuan-*.apk "release-artifacts/unlock-1113-$VERSION-android-arm64.apk"
-          cp app/build/outputs/apk/appdev/release/siyuan-*.apk "release-artifacts/unlock-1113-$VERSION-android-arm64-appdev.apk"
+          cp app/build/outputs/apk/googleplay/release/siyuan-*.apk "release-artifacts/unlock-1113-$VERSION-android-arm64$suffix.apk"
+          cp app/build/outputs/apk/appdev/release/siyuan-*.apk "release-artifacts/unlock-1113-$VERSION-android-arm64-appdev$suffix.apk"
 
       - name: Upload Android artifacts
         uses: actions/upload-artifact@v4
