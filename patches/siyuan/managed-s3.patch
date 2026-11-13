@@ -4857,7 +4857,7 @@ diff --git a/kernel/model/managed_storage_test.go b/kernel/model/managed_storage
 new file mode 100644
 --- /dev/null
 +++ b/kernel/model/managed_storage_test.go
-@@ -0,0 +1,506 @@
+@@ -0,0 +1,507 @@
 +// SiYuan - https://github.com/siyuan-note/siyuan
 +// Copyright (c) 2020-present, b3log.org
 +// SPDX-License-Identifier: AGPL-3.0-or-later
@@ -4912,6 +4912,7 @@ new file mode 100644
 +	t.Setenv("SIYUAN_MANAGED_STORAGE_KEY_FILE", "")
 +	t.Setenv("SIYUAN_MANAGED_STORAGE_ALLOW_HTTP", "true")
 +	f := &managedStorageFixture{active: true, verified: true}
++	sessionExpiresAt := time.Now().Add(24 * time.Hour).Unix()
 +	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 +		f.mu.Lock()
 +		defer f.mu.Unlock()
@@ -4930,7 +4931,7 @@ new file mode 100644
 +				_ = json.NewEncoder(w).Encode(map[string]any{"status": "error", "code": "login_failed"})
 +				return
 +			}
-+			data = managedStorageTokens{AccessToken: "fixture-access", RefreshToken: "fixture-refresh", TokenType: "Bearer", ExpiresAt: time.Now().Add(time.Hour).Unix(), SessionExpiresAt: time.Now().Add(24 * time.Hour).Unix()}
++			data = managedStorageTokens{AccessToken: "fixture-access", RefreshToken: "fixture-refresh", TokenType: "Bearer", ExpiresAt: time.Now().Add(time.Hour).Unix(), SessionExpiresAt: sessionExpiresAt}
 +		case "refresh":
 +			f.refreshes++
 +			if f.invalidTokens {
@@ -4938,7 +4939,7 @@ new file mode 100644
 +				_ = json.NewEncoder(w).Encode(map[string]any{"status": "error", "code": "invalid_refresh_token"})
 +				return
 +			}
-+			data = managedStorageTokens{AccessToken: "refreshed-access", RefreshToken: "refreshed-refresh", TokenType: "Bearer", ExpiresAt: time.Now().Add(time.Hour).Unix(), SessionExpiresAt: time.Now().Add(24 * time.Hour).Unix()}
++			data = managedStorageTokens{AccessToken: "refreshed-access", RefreshToken: "refreshed-refresh", TokenType: "Bearer", ExpiresAt: time.Now().Add(time.Hour).Unix(), SessionExpiresAt: sessionExpiresAt}
 +		case "me":
 +			data = managedStorageUser{ID: "fixture-account", Name: "fixture-user", EmailVerified: f.verified}
 +		case "subscription":
