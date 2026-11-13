@@ -4857,7 +4857,7 @@ diff --git a/kernel/model/managed_storage_test.go b/kernel/model/managed_storage
 new file mode 100644
 --- /dev/null
 +++ b/kernel/model/managed_storage_test.go
-@@ -0,0 +1,505 @@
+@@ -0,0 +1,506 @@
 +// SiYuan - https://github.com/siyuan-note/siyuan
 +// Copyright (c) 2020-present, b3log.org
 +// SPDX-License-Identifier: AGPL-3.0-or-later
@@ -4881,6 +4881,7 @@ new file mode 100644
 +	smithyhttp "github.com/aws/smithy-go/transport/http"
 +	"github.com/siyuan-note/siyuan/kernel/conf"
 +	"github.com/siyuan-note/siyuan/kernel/util"
++	"github.com/zalando/go-keyring"
 +)
 +
 +type managedStorageFixture struct {
@@ -4907,11 +4908,8 @@ new file mode 100644
 +	Conf.Sync.Load().Provider, Conf.Sync.Load().Enabled = conf.ProviderS3, false
 +	Conf.Sync.Load().ManagedStorage = false
 +	Conf.Sync.Load().S3 = &conf.S3{Endpoint: "https://manual.example", Bucket: "manual", AccessKey: "manual-access", SecretKey: "manual-secret", Region: "us-east-1"}
-+	key := filepath.Join(t.TempDir(), "wrapping-key")
-+	if err := os.WriteFile(key, []byte(strings.Repeat("ab", 32)), 0600); err != nil {
-+		t.Fatal(err)
-+	}
-+	t.Setenv("SIYUAN_MANAGED_STORAGE_KEY_FILE", key)
++	keyring.MockInit()
++	t.Setenv("SIYUAN_MANAGED_STORAGE_KEY_FILE", "")
 +	t.Setenv("SIYUAN_MANAGED_STORAGE_ALLOW_HTTP", "true")
 +	f := &managedStorageFixture{active: true, verified: true}
 +	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -5275,6 +5273,9 @@ new file mode 100644
 +		t.Fatal("logout retained active storage or API credentials")
 +	}
 +	var saved managedStorageSession
++	if c.store == nil {
++		t.Fatal("login did not initialize the protected store")
++	}
 +	if err := c.store.load(&saved); err != nil || !saved.LoggedOut || len(saved.Pending) != 1 || saved.Storage != nil {
 +		t.Fatal("offline revocation queue was not protected and persisted")
 +	}
