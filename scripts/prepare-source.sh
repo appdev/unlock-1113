@@ -12,9 +12,12 @@ if [[ -e "$destination" || -L "$destination" ]]; then
   exit 1
 fi
 
-# The shared patches use LF context, including on Git for Windows.
-git clone --config core.autocrlf=false --no-local --branch "$version" --depth 1 -- "$upstream" "$destination"
+# Apply against the upstream Git blobs before platform checkout filters run.
+git clone --config core.autocrlf=false --no-checkout --no-local --branch "$version" --depth 1 -- "$upstream" "$destination"
 test "$(git -C "$destination" rev-parse HEAD)" = "$commit"
+git -C "$destination" read-tree HEAD
 for patch in disable-update default-config mock-vip-user hide-account-entry first-launch-notice managed-s3; do
-  git -C "$destination" apply "$repo/patches/siyuan/$patch.patch"
+  patch_path="$repo/patches/siyuan/$patch.patch"
+  sed 's/\r$//' "$patch_path" | git -C "$destination" apply --cached
 done
+git -C "$destination" checkout-index --all
