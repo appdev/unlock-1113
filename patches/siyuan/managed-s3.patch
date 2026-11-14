@@ -3400,9 +3400,10 @@ diff --git a/kernel/model/lan_sync.go b/kernel/model/lan_sync.go
  	if conf.ProviderS3 == confSyncSnapshot.Provider {
 diff --git a/kernel/model/managed_storage.go b/kernel/model/managed_storage.go
 new file mode 100644
+index 0000000..a97bf6a
 --- /dev/null
 +++ b/kernel/model/managed_storage.go
-@@ -0,0 +1,782 @@
+@@ -0,0 +1,816 @@
 +// SiYuan - https://github.com/siyuan-note/siyuan
 +// Copyright (c) 2020-present, b3log.org
 +// SPDX-License-Identifier: AGPL-3.0-or-later
@@ -3478,11 +3479,11 @@ new file mode 100644
 +	Endpoint            string `json:"endpoint"`
 +	Region              string `json:"region"`
 +	Bucket              string `json:"bucket"`
++	Repository          string `json:"repository"`
 +	AccessKeyID         string `json:"accessKeyId"`
 +	SecretAccessKey     string `json:"secretAccessKey"`
 +	ForcePathStyle      bool   `json:"forcePathStyle"`
 +	CredentialsExpireAt int64  `json:"credentialsExpireAt"`
-+	MaxObjectBytes      int64  `json:"maxObjectBytes"`
 +	ConcurrentReqs      int    `json:"concurrentReqs"`
 +}
 +
@@ -3499,16 +3500,17 @@ new file mode 100644
 +}
 +
 +type managedStorageClient struct {
-+	mu         sync.Mutex
-+	origin     string
-+	client     *http.Client
-+	session    *managedStorageSession
-+	store      *managedStorageStore
-+	state      string
-+	errCode    string
-+	used       int64
-+	retryTimer *time.Timer
-+	retryDelay time.Duration
++	mu                sync.Mutex
++	origin            string
++	client            *http.Client
++	session           *managedStorageSession
++	store             *managedStorageStore
++	state             string
++	errCode           string
++	used              int64
++	retryTimer        *time.Timer
++	retryDelay        time.Duration
++	storageNegotiated bool
 +}
 +
 +type managedStorageError struct{ code string }
@@ -3694,16 +3696,39 @@ new file mode 100644
 +		!storage.ForcePathStyle || storage.CredentialsExpireAt <= time.Now().Unix() || storage.CredentialsExpireAt > c.session.Tokens.SessionExpiresAt {
 +		return managedError("invalid_response")
 +	}
-+	origin, _ := url.Parse(c.origin)
 +	endpoint, err := url.Parse(storage.Endpoint)
-+	if err != nil || endpoint.Scheme != origin.Scheme || endpoint.Host != origin.Host || endpoint.User != nil ||
-+		endpoint.RawQuery != "" || endpoint.Fragment != "" || strings.TrimRight(endpoint.Path, "/") != "/s3" {
++	if err != nil || endpoint.Scheme != "https" || endpoint.Hostname() == "" || endpoint.User != nil ||
++		endpoint.ForceQuery || endpoint.RawQuery != "" || endpoint.Fragment != "" ||
++		(endpoint.Path != "" && endpoint.Path != "/") || storage.Repository == "" || !strings.HasPrefix(storage.Bucket, "cdp-") {
 +		return managedError("invalid_response")
 +	}
 +	if storage.ConcurrentReqs < 1 || storage.ConcurrentReqs > 2 {
 +		storage.ConcurrentReqs = 2
 +	}
 +	return nil
++}
++
++func (c *managedStorageClient) fetchStorageLocked(ctx context.Context) error {
++	var storage managedStorageConfig
++	if err := c.authorizedLocked(ctx, "POST", "storage-config", map[string]bool{"directS3": true}, &storage); err != nil {
++		return err
++	}
++	if err := c.validateStorage(&storage); err != nil {
++		return err
++	}
++	if current := c.session.Storage; current != nil && current.Repository != "" &&
++		(current.Repository != storage.Repository || current.Endpoint != storage.Endpoint || current.Bucket != storage.Bucket) {
++		return managedError("source_incomplete")
++	}
++	c.session.Storage = &storage
++	c.storageNegotiated = true
++	return nil
++}
++
++func (c *managedStorageClient) storageNeedsRefresh() bool {
++	storage := c.session.Storage
++	return storage != nil && (!c.storageNegotiated ||
++		storage.CredentialsExpireAt <= time.Now().Add(2*time.Minute).Unix())
 +}
 +
 +func (c *managedStorageClient) updateLocked(ctx context.Context, provision bool) error {
@@ -3727,15 +3752,10 @@ new file mode 100644
 +		c.state = "subscription_required"
 +		return nil
 +	}
-+	if provision && c.session.Storage == nil {
-+		var storage managedStorageConfig
-+		if err := c.authorizedLocked(ctx, "POST", "storage-config", nil, &storage); err != nil {
++	if (provision && c.session.Storage == nil) || c.storageNeedsRefresh() {
++		if err := c.fetchStorageLocked(ctx); err != nil {
 +			return err
 +		}
-+		if err := c.validateStorage(&storage); err != nil {
-+			return err
-+		}
-+		c.session.Storage = &storage
 +	}
 +	c.state = "ready"
 +	if c.session.Storage == nil {
@@ -3900,6 +3920,7 @@ new file mode 100644
 +		return status, managedError("repo_key_conflict")
 +	}
 +	current.session, current.store = candidate.session, candidate.store
++	current.storageNegotiated = candidate.storageNegotiated
 +	current.state, current.errCode = candidate.state, candidate.errCode
 +	current.session.AutoSyncPending = enableSync && candidate.session.Storage != nil
 +	start := current.session.AutoSyncPending && len(Conf.Repo.Load().Key) > 0
@@ -4113,7 +4134,7 @@ new file mode 100644
 +	if c.session.RepoKeyID != "" && c.session.RepoKeyID != managedRepoKeyID(Conf.Repo.Load().Key) {
 +		return nil, managedError("repo_key_conflict")
 +	}
-+	if c.session.Tokens.SessionExpiresAt <= time.Now().Unix() || c.session.Storage.CredentialsExpireAt <= time.Now().Unix() {
++	if c.session.Tokens.SessionExpiresAt <= time.Now().Unix() {
 +		return nil, managedError("session_expired")
 +	}
 +	if !c.session.User.EmailVerified {
@@ -4123,7 +4144,20 @@ new file mode 100644
 +	if err != nil || !c.session.Plan.Active || !expires.After(time.Now()) {
 +		return nil, managedError("subscription_required")
 +	}
++	if c.storageNeedsRefresh() {
++		ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
++		defer cancel()
++		if err = c.updateLocked(ctx, false); err != nil {
++			return nil, err
++		}
++		if c.state != "ready" {
++			return nil, managedError(c.state)
++		}
++	}
 +	storage := c.session.Storage
++	if storage.CredentialsExpireAt <= time.Now().Unix() {
++		return nil, managedError("session_expired")
++	}
 +	return &conf.S3{Endpoint: storage.Endpoint, AccessKey: storage.AccessKeyID, SecretKey: storage.SecretAccessKey,
 +		Bucket: storage.Bucket, Region: storage.Region, PathStyle: true, Timeout: 60, ConcurrentReqs: storage.ConcurrentReqs}, nil
 +}
@@ -4159,6 +4193,7 @@ new file mode 100644
 +			if c.session == nil || c.session != session || c.session.LoggedOut {
 +				return
 +			}
++			c.storageNegotiated = false
 +			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 +			defer cancel()
 +			if err := c.updateLocked(ctx, false); err != nil {
@@ -4206,102 +4241,6 @@ new file mode 100644
 +		err = repo.AddTag(id, tag)
 +	}
 +	return
-+}
-diff --git a/kernel/model/managed_storage_gateway_integration_test.go b/kernel/model/managed_storage_gateway_integration_test.go
-new file mode 100644
---- /dev/null
-+++ b/kernel/model/managed_storage_gateway_integration_test.go
-@@ -0,0 +1,91 @@
-+// SiYuan - https://github.com/siyuan-note/siyuan
-+// Copyright (c) 2020-present, b3log.org
-+// SPDX-License-Identifier: AGPL-3.0-or-later
-+
-+package model
-+
-+import (
-+	"bytes"
-+	"context"
-+	"fmt"
-+	"io"
-+	"net/http"
-+	"os"
-+	"strings"
-+	"testing"
-+	"time"
-+
-+	"github.com/aws/aws-sdk-go-v2/aws"
-+	"github.com/aws/aws-sdk-go-v2/credentials"
-+	s3sdk "github.com/aws/aws-sdk-go-v2/service/s3"
-+	"github.com/siyuan-note/siyuan/kernel/conf"
-+	"github.com/siyuan-note/siyuan/kernel/util"
-+)
-+
-+func TestManagedStorageRealGateway(t *testing.T) {
-+	if os.Getenv("SIYUAN_MANAGED_STORAGE_E2E") != "1" {
-+		t.Skip("requires the isolated portal and RustFS integration environment")
-+	}
-+	setupCloudAccountAuthTest(t)
-+	oldHome, oldWorkspace := util.HomeDir, util.WorkspaceDir
-+	util.HomeDir, util.WorkspaceDir = t.TempDir(), t.TempDir()
-+	t.Cleanup(func() { util.HomeDir, util.WorkspaceDir = oldHome, oldWorkspace })
-+	Conf.Sync.Load().Provider, Conf.Sync.Load().Enabled = conf.ProviderS3, false
-+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
-+	defer cancel()
-+	if _, err := LoginManagedStorage(ctx, os.Getenv("SIYUAN_MANAGED_STORAGE_TEST_USERNAME"), os.Getenv("SIYUAN_MANAGED_STORAGE_TEST_PASSWORD"), false); err != nil {
-+		t.Fatal(err)
-+	}
-+	t.Cleanup(func() { _, _ = LogoutManagedStorage(context.Background()) })
-+	config, err := effectiveSyncS3()
-+	if err != nil {
-+		t.Fatal(err)
-+	}
-+	svc := s3sdk.New(s3sdk.Options{Region: config.Region, BaseEndpoint: aws.String(config.Endpoint), UsePathStyle: true,
-+		Credentials: credentials.NewStaticCredentialsProvider(config.AccessKey, config.SecretKey, ""), HTTPClient: &http.Client{Timeout: 20 * time.Second}})
-+	prefix := fmt.Sprintf("managed-probe/%d/", time.Now().UnixNano())
-+	keys := make([]string, 0, 1000)
-+	t.Cleanup(func() {
-+		for _, key := range keys {
-+			_, _ = svc.DeleteObject(context.Background(), &s3sdk.DeleteObjectInput{Bucket: aws.String(config.Bucket), Key: aws.String(key)})
-+		}
-+	})
-+	data := []byte(strings.Repeat("storage-probe", 128))
-+	start, firstHundred := time.Now(), time.Duration(0)
-+	for i := 0; i < 1000; i++ {
-+		key := fmt.Sprintf("%s%04d 空格+中文.bin", prefix, i)
-+		keys = append(keys, key)
-+		if _, err = svc.PutObject(ctx, &s3sdk.PutObjectInput{Bucket: aws.String(config.Bucket), Key: aws.String(key), Body: bytes.NewReader(data)}); err != nil {
-+			t.Fatalf("real SDK write %d failed: %v", i, err)
-+		}
-+		if i == 99 {
-+			firstHundred = time.Since(start)
-+		}
-+	}
-+	t.Logf("real gateway 1000 objects: first 100=%s, next 900=%s", firstHundred, time.Since(start)-firstHundred)
-+	head, err := svc.HeadObject(ctx, &s3sdk.HeadObjectInput{Bucket: aws.String(config.Bucket), Key: aws.String(keys[0])})
-+	if err != nil || aws.ToInt64(head.ContentLength) != int64(len(data)) {
-+		t.Fatal("real HEAD metadata mismatch")
-+	}
-+	part, err := svc.GetObject(ctx, &s3sdk.GetObjectInput{Bucket: aws.String(config.Bucket), Key: aws.String(keys[0]), Range: aws.String("bytes=2-8"), ResponseCacheControl: aws.String("no-cache")})
-+	if err != nil {
-+		t.Fatal(err)
-+	}
-+	read, err := io.ReadAll(part.Body)
-+	_ = part.Body.Close()
-+	if err != nil || !bytes.Equal(read, data[2:9]) || aws.ToString(part.CacheControl) != "no-cache" {
-+		t.Fatal("real SDK Range/response override mismatch")
-+	}
-+	count := 0
-+	pages := s3sdk.NewListObjectsV2Paginator(svc, &s3sdk.ListObjectsV2Input{Bucket: aws.String(config.Bucket), Prefix: aws.String(prefix), MaxKeys: aws.Int32(137)})
-+	for pages.HasMorePages() {
-+		page, err := pages.NextPage(ctx)
-+		if err != nil {
-+			t.Fatal(err)
-+		}
-+		count += len(page.Contents)
-+	}
-+	if count != len(keys) {
-+		t.Fatalf("real SDK V2 pagination counted %d, want %d", count, len(keys))
-+	}
 +}
 diff --git a/kernel/model/managed_storage_integration_test.go b/kernel/model/managed_storage_integration_test.go
 new file mode 100644
@@ -4516,6 +4455,7 @@ new file mode 100644
 +}
 diff --git a/kernel/model/managed_storage_key.go b/kernel/model/managed_storage_key.go
 new file mode 100644
+index 0000000..534cb7e
 --- /dev/null
 +++ b/kernel/model/managed_storage_key.go
 @@ -0,0 +1,64 @@
@@ -4575,7 +4515,7 @@ new file mode 100644
 +		return nil, err
 +	}
 +	key, err := base64.StdEncoding.DecodeString(response.RepoKey)
-+	if err != nil || len(key) != 32 || response.Version != 1 || response.AccountID != c.session.User.ID || response.Bucket != c.session.Storage.Bucket {
++	if err != nil || len(key) != 32 || response.Version != 1 || response.AccountID != c.session.User.ID || response.Bucket != c.session.Storage.Repository {
 +		return nil, managedError("invalid_response")
 +	}
 +	if len(local) > 0 && !bytes.Equal(local, key) {
@@ -4855,9 +4795,10 @@ new file mode 100644
 +}
 diff --git a/kernel/model/managed_storage_test.go b/kernel/model/managed_storage_test.go
 new file mode 100644
+index 0000000..2680d69
 --- /dev/null
 +++ b/kernel/model/managed_storage_test.go
-@@ -0,0 +1,507 @@
+@@ -0,0 +1,535 @@
 +// SiYuan - https://github.com/siyuan-note/siyuan
 +// Copyright (c) 2020-present, b3log.org
 +// SPDX-License-Identifier: AGPL-3.0-or-later
@@ -4884,6 +4825,8 @@ new file mode 100644
 +	"github.com/zalando/go-keyring"
 +)
 +
++const fixtureRustFSBucket = "cdp-00000000-0000-0000-0000-000000000001"
++
 +type managedStorageFixture struct {
 +	mu            sync.Mutex
 +	origin        string
@@ -4897,6 +4840,8 @@ new file mode 100644
 +	repoKey       []byte
 +	repoKeyError  string
 +	repoKeyBad    bool
++	storageCalls  int
++	storageTTL    time.Duration
 +}
 +
 +func managedStorageTestSetup(t *testing.T) *managedStorageFixture {
@@ -4911,7 +4856,7 @@ new file mode 100644
 +	keyring.MockInit()
 +	t.Setenv("SIYUAN_MANAGED_STORAGE_KEY_FILE", "")
 +	t.Setenv("SIYUAN_MANAGED_STORAGE_ALLOW_HTTP", "true")
-+	f := &managedStorageFixture{active: true, verified: true}
++	f := &managedStorageFixture{active: true, verified: true, storageTTL: 20 * time.Minute}
 +	sessionExpiresAt := time.Now().Add(24 * time.Hour).Unix()
 +	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 +		f.mu.Lock()
@@ -4945,11 +4890,15 @@ new file mode 100644
 +		case "subscription":
 +			data = managedStorageSubscription{Active: f.active, EmailVerified: f.verified, ExpiresAt: time.Now().Add(24 * time.Hour).UTC().Format(time.RFC3339), QuotaBytes: 10_000_000_000}
 +		case "storage-config":
-+			endpoint := f.origin + "/s3"
++			f.storageCalls++
++			endpoint := "https://s3api.example"
 +			if f.storageBad {
-+				endpoint = "https://untrusted.example/s3"
++				endpoint = f.origin + "/s3"
 +			}
-+			data = managedStorageConfig{Endpoint: endpoint, Region: "us-east-1", Bucket: "fixture-space", AccessKeyID: "fixture-s3-access", SecretAccessKey: "fixture-s3-secret", ForcePathStyle: true, CredentialsExpireAt: time.Now().Add(12 * time.Hour).Unix(), ConcurrentReqs: 2, MaxObjectBytes: 64 << 20}
++			data = managedStorageConfig{Endpoint: endpoint, Region: "us-east-1", Bucket: fixtureRustFSBucket,
++				Repository: "fixture-space", AccessKeyID: fmt.Sprint("fixture-direct-", f.storageCalls),
++				SecretAccessKey: "fixture-s3-secret", ForcePathStyle: true,
++				CredentialsExpireAt: time.Now().Add(f.storageTTL).Unix(), ConcurrentReqs: 2}
 +		case "logout":
 +			f.logouts++
 +			if f.invalidTokens {
@@ -5006,6 +4955,26 @@ new file mode 100644
 +		}
 +	})
 +	return f
++}
++
++func TestManagedStorageRenewsDirectCredentials(t *testing.T) {
++	f := managedStorageTestSetup(t)
++	f.storageTTL = time.Minute
++	if _, err := LoginManagedStorage(context.Background(), "fixture-user", "synthetic-password", false); err != nil {
++		t.Fatal(err)
++	}
++	c, _ := currentManagedStorageClient()
++	initialAccess := c.session.Storage.AccessKeyID
++	f.storageTTL = 20 * time.Minute
++	renewed, err := effectiveManagedStorageS3()
++	if err != nil || renewed.AccessKey == initialAccess || renewed.Bucket != fixtureRustFSBucket || renewed.Endpoint != "https://s3api.example" {
++		t.Fatalf("credential renewal did not preserve the physical bucket: %v", err)
++	}
++	c.mu.Lock()
++	defer c.mu.Unlock()
++	if c.session.Storage.Repository != "fixture-space" || f.storageCalls != 2 {
++		t.Fatal("renewal changed the logical repository or called the service unexpectedly")
++	}
 +}
 +
 +func TestQingYuProviderSelectionPreservesManualS3(t *testing.T) {
@@ -5117,7 +5086,7 @@ new file mode 100644
 +		t.Fatal("login modified unrelated identity, key, or manual configuration")
 +	}
 +	cloud, err := buildCloudConf()
-+	if err != nil || cloud.S3.Bucket != "fixture-space" || cloud.S3.SecretKey != "fixture-s3-secret" || cloud.S3.SkipTlsVerify {
++	if err != nil || cloud.S3.Bucket != fixtureRustFSBucket || cloud.S3.SecretKey != "fixture-s3-secret" || cloud.S3.SkipTlsVerify {
 +		t.Fatal("effective managed S3 was not applied with TLS verification")
 +	}
 +	raw, err := json.Marshal(Conf)
@@ -5425,21 +5394,22 @@ diff --git a/kernel/model/repository.go b/kernel/model/repository.go
  	case conf.ProviderWebDAV:
  		ret.WebDAV = &cloud.ConfWebDAV{
 diff --git a/kernel/model/sync.go b/kernel/model/sync.go
+index 8441fc6..a9890dc 100644
 --- a/kernel/model/sync.go
 +++ b/kernel/model/sync.go
-@@ -466,6 +466,11 @@
- 		if !IsPaidUser() {
+@@ -467,6 +467,11 @@ func checkSync(boot, exit, byHand bool) bool {
  			UpdateSyncConf(func(s *conf.Sync) { s.Enabled = false })
  			return false
-+		}
+ 		}
 +		if confSyncReadSnapshot.Provider == conf.ProviderS3 && confSyncReadSnapshot.ManagedStorage {
 +			if _, err := effectiveSyncS3(); err != nil {
 +				return false
 +			}
- 		}
++		}
  	}
  
-@@ -670,7 +675,12 @@
+ 	if !byHand && !exit && notifyAutoSyncPaused() {
+@@ -670,7 +675,12 @@ func SetSyncMode(mode int) {
  func SetSyncProvider(provider int, completeAssets bool) (err error) {
  	release := lockAssetSourceChange()
  	defer release()
@@ -5453,7 +5423,7 @@ diff --git a/kernel/model/sync.go b/kernel/model/sync.go
  		if completeAssets {
  			util.PushEndlessProgress(Conf.Language(398))
  			defer util.ClearPushProgress(100)
-@@ -686,7 +696,7 @@
+@@ -686,7 +696,7 @@ func SetSyncProvider(provider int, completeAssets bool) (err error) {
  			return
  		}
  	}
@@ -5462,7 +5432,7 @@ diff --git a/kernel/model/sync.go b/kernel/model/sync.go
  	refreshLANSyncManager()
  	return
  }
-@@ -706,14 +716,14 @@
+@@ -706,14 +716,14 @@ func SetSyncProviderS3(s3 *conf.S3) (err error) {
  	s3.Region = strings.TrimSpace(s3.Region)
  	s3.Timeout = util.NormalizeTimeout(s3.Timeout)
  	s3.ConcurrentReqs = util.NormalizeConcurrentReqs(s3.ConcurrentReqs, conf.ProviderS3)
@@ -5479,6 +5449,20 @@ diff --git a/kernel/model/sync.go b/kernel/model/sync.go
  	refreshLANSyncManager()
  	return
  }
+@@ -906,6 +916,13 @@ func ListCloudSyncDir() (syncDirs []*Sync, hSize string, err error) {
+ 
+ 	assetDownloadSourceMu.RLock()
+ 	defer assetDownloadSourceMu.RUnlock()
++	if confSyncSnapshot.ManagedStorage {
++		s3, storageErr := effectiveManagedStorageS3()
++		if storageErr != nil {
++			return []*Sync{}, "-", errors.New(formatRepoErrorMsg(storageErr))
++		}
++		return []*Sync{{CloudName: s3.Bucket, HSize: "-"}}, "-", nil
++	}
+ 	syncDirs = []*Sync{}
+ 	var dirs []*cloud.Repo
+ 	var size int64
 diff --git a/kernel/model/unlock_cloud_account_test.go b/kernel/model/unlock_cloud_account_test.go
 --- a/kernel/model/unlock_cloud_account_test.go
 +++ b/kernel/model/unlock_cloud_account_test.go
