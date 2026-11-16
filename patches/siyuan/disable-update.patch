@@ -1,8 +1,55 @@
+diff --git a/app/src/config/tabs/aboutTab.ts b/app/src/config/tabs/aboutTab.ts
+index e824aba..b49d972 100644
+--- a/app/src/config/tabs/aboutTab.ts
++++ b/app/src/config/tabs/aboutTab.ts
+@@ -1,6 +1,7 @@
+ import type {SettingTabBuilder} from "../setting/builder";
+ import {Constants} from "../../constants";
+ import {fetchPost} from "../../util/fetch";
++import {fetchWithAppId} from "../../util/fetchWithAppId";
+ import {getCloudURL} from "../util/about";
+ import {openLink} from "../../editor/openLink";
+ import {sendAppSetting} from "./appRuntime";
+@@ -172,7 +173,17 @@ const mountAboutVersionSlot = (root: HTMLElement) => {
+             return;
+         }
+         svgElement.classList.add("fn__rotate");
+-        fetchPost("/api/system/checkUpdate", {showMsg: true}, () => {
++        void fetchWithAppId("/api/system/checkUpdate", {
++            method: "POST",
++            body: JSON.stringify({showMsg: true}),
++        }).then((response) => {
++            const downloadURL = response.headers.get("X-QingYu-Update-URL");
++            if (response.ok && downloadURL === "https://sy.apkdv.com/download") {
++                openLink(window.siyuan.ws.app, downloadURL);
++            }
++        }).catch((error: Error) => {
++            console.warn("Check for updates failed", error);
++        }).finally(() => {
+             svgElement.classList.remove("fn__rotate");
+         });
+     });
+diff --git a/kernel/api/system.go b/kernel/api/system.go
+index cd9c58b..cd1b73f 100644
+--- a/kernel/api/system.go
++++ b/kernel/api/system.go
+@@ -413,8 +413,9 @@ func normalizeCustomEmojiPath(name, ext string) (string, error) {
+ var checkUpdate = contractHandler(apicontract.SystemCheckUpdate, func(c *gin.Context, request apicontract.SystemCheckUpdateRequest) (ret apicontract.Response[apicontract.Null]) {
+ 	ret = apicontract.Success(apicontract.Null{})
+ 
+-	showMsg := request.ShowMsg
+-	model.CheckUpdate(showMsg)
++	if downloadURL := model.CheckUpdate(request.ShowMsg); downloadURL != "" {
++		c.Header("X-QingYu-Update-URL", downloadURL)
++	}
+ 	return
+ })
+ 
 diff --git a/kernel/conf/system.go b/kernel/conf/system.go
-index c1f30b5..24eca99 100644
+index 83bc953..85b0630 100644
 --- a/kernel/conf/system.go
 +++ b/kernel/conf/system.go
-@@ -73,7 +73,7 @@ type Onboarding struct {
+@@ -61,7 +61,7 @@ type Onboarding struct {
  func NewSystem() *System {
  	return &System{
  		NetworkProxy:       &NetworkProxy{},
@@ -11,19 +58,193 @@ index c1f30b5..24eca99 100644
  		UpdateChannel:      UpdateChannelStable,
  	}
  }
+diff --git a/kernel/model/qingyu_release.go b/kernel/model/qingyu_release.go
+new file mode 100644
+index 0000000..5db45a3
+--- /dev/null
++++ b/kernel/model/qingyu_release.go
+@@ -0,0 +1,44 @@
++package model
++
++import (
++	"regexp"
++
++	"golang.org/x/mod/semver"
++)
++
++const qingyuDownloadURL = "https://sy.apkdv.com/download"
++
++// Set by the release workflows. Local builds without a tag fall back to the upstream version.
++var qingyuBuildTag string
++
++var qingyuStableTag = regexp.MustCompile(`^(v[0-9]+\.[0-9]+\.[0-9]+)(?:-(?:qingyu\.)?([1-9][0-9]*))?$`)
++
++// A plain tag is revision zero. A QingYu revision is a stable build of the
++// same upstream version, so it sorts after the plain tag and after previews.
++func qingyuStableVersion(version string) (base, order string) {
++	tag := normalizeReleaseVersion(version)
++	parts := qingyuStableTag.FindStringSubmatch(tag)
++	if parts == nil || !semver.IsValid(tag) {
++		return "", ""
++	}
++	revision := parts[2]
++	if revision == "" {
++		revision = "0"
++	}
++	return parts[1], parts[1] + "-qingyu." + revision
++}
++
++func compareUpdateVersions(a, b string) int {
++	baseA, orderA := qingyuStableVersion(a)
++	baseB, orderB := qingyuStableVersion(b)
++	if baseA != "" && baseB != "" {
++		return semver.Compare(orderA, orderB)
++	}
++	if baseA == "" {
++		baseA = normalizeReleaseVersion(a)
++	}
++	if baseB == "" {
++		baseB = normalizeReleaseVersion(b)
++	}
++	return semver.Compare(baseA, baseB)
++}
+diff --git a/kernel/model/qingyu_release_test.go b/kernel/model/qingyu_release_test.go
+new file mode 100644
+index 0000000..17c0334
+--- /dev/null
++++ b/kernel/model/qingyu_release_test.go
+@@ -0,0 +1,56 @@
++package model
++
++import (
++	"testing"
++	"time"
++
++	"github.com/siyuan-note/siyuan/kernel/conf"
++)
++
++func TestQingYuStableUpdate(t *testing.T) {
++	githubReleasesLock.Lock()
++	originalReleases, originalTime := cachedGitHubReleases, githubReleasesCacheTime
++	cachedGitHubReleases = []*githubRelease{
++		{TagName: "v3.8.9", HTMLURL: "https://example.invalid/releases"},
++		{TagName: "v3.8.9-qingyu.1"},
++		{TagName: "v3.8.9-qingyu.2", HTMLURL: "https://example.invalid/releases"},
++		{TagName: "v3.8.9-qingyu.3", Draft: true},
++		{TagName: "v3.8.9-qingyu.4", Prerelease: true},
++		{TagName: "v3.8.10-beta.1", Prerelease: true},
++	}
++	githubReleasesCacheTime = time.Now().Unix()
++	githubReleasesLock.Unlock()
++	t.Cleanup(func() {
++		githubReleasesLock.Lock()
++		cachedGitHubReleases, githubReleasesCacheTime = originalReleases, originalTime
++		githubReleasesLock.Unlock()
++	})
++
++	release, err := getGitHubUpdateRelease(conf.UpdateChannelStable, false)
++	if err != nil {
++		t.Fatal(err)
++	}
++	if release.Version != "3.8.9-qingyu.2" || release.ReleaseURL != "https://sy.apkdv.com/download" || len(release.Packages) != 0 {
++		t.Fatalf("unexpected stable QingYu release: %+v", release)
++	}
++
++	originalBuild := qingyuBuildTag
++	t.Cleanup(func() { qingyuBuildTag = originalBuild })
++	qingyuBuildTag = "v3.8.9-qingyu.1"
++	if isVersionUpToDate(release.Version) {
++		t.Fatal("revision .1 did not detect revision .2")
++	}
++	qingyuBuildTag = "v3.8.9-qingyu.2"
++	if !isVersionUpToDate(release.Version) {
++		t.Fatal("revision .2 detected itself as newer")
++	}
++	if isVersionUpToDate("3.8.9-10") || isVersionUpToDate("3.8.9-3") || !isVersionUpToDate("3.8.9-2") {
++		t.Fatal("numeric revision tags must compare with the equivalent QingYu revision")
++	}
++	if isVersionUpToDate("3.8.10") {
++		t.Fatal("a newer base version must take precedence over its QingYu revision")
++	}
++	if !isVersionUpToDate("3.8.9-rc.1") {
++		t.Fatal("a same-version preview must not supersede a QingYu stable release")
++	}
++}
 diff --git a/kernel/model/updater.go b/kernel/model/updater.go
-index 449ad20..024ec22 100644
+index fa527ee..1813ffb 100644
 --- a/kernel/model/updater.go
 +++ b/kernel/model/updater.go
-@@ -31,6 +31,7 @@ import (
+@@ -20,8 +20,8 @@ import (
  	"github.com/88250/gulu"
  	"github.com/imroc/req/v3"
  	"github.com/siyuan-note/logging"
 +	"github.com/siyuan-note/siyuan/kernel/conf"
  	"github.com/siyuan-note/siyuan/kernel/util"
- 	"golang.org/x/mod/semver"
+-	"golang.org/x/mod/semver"
  )
-@@ -301,6 +302,12 @@ var skipInstallPkgPlatformCached = -1
+ 
+ func getNewVerInstallPkgPath(preserve bool) string {
+@@ -321,33 +321,42 @@ func getAnnouncements() (ret []*Announcement) {
+ 	return
+ }
+ 
+-func CheckUpdate(showMsg bool) {
++// CheckUpdate returns the official download page for a newer QingYu release.
++func CheckUpdate(showMsg bool) string {
+ 	if !showMsg {
+-		return
++		return ""
+ 	}
+ 
+ 	if Conf.System.Load().IsMicrosoftStore {
+-		return
++		return ""
+ 	}
+ 
+ 	release, err := getUpdateRelease(showMsg)
+ 	if err != nil {
+-		return
++		return ""
+ 	}
+ 
+ 	if isVersionUpToDate(release.Version) {
+ 		util.PushUpdateMsg("update-notify", Conf.Language(10), 3000)
+ 	} else {
+ 		pushNewVersionNotification(release)
++		if release.ReleaseURL == qingyuDownloadURL {
++			return qingyuDownloadURL
++		}
+ 	}
+ 	go func() {
+ 		defer logging.Recover()
+ 		checkDownloadInstallPkg(false)
+ 	}()
++	return ""
+ }
+ 
+ func pushNewVersionNotification(release *updateRelease) {
+ 	releaseLink := "<a href=\"" + release.ReleaseURL + "\">" + release.ReleaseURL + "</a>"
++	if release.ReleaseURL == qingyuDownloadURL {
++		releaseLink = fmt.Sprintf(`<a href="%s" target="_blank" rel="noopener noreferrer">v%s</a>`,
++			qingyuDownloadURL, html.EscapeString(release.Version))
++	}
+ 	message := fmt.Sprintf(Conf.Language(9), releaseLink)
+ 	if !skipNewVerInstallPkg() {
+ 		if _, err := getReleaseInstallPackage(release); err == nil {
+@@ -359,7 +368,11 @@ func pushNewVersionNotification(release *updateRelease) {
+ }
+ 
+ func isVersionUpToDate(releaseVer string) bool {
+-	return semver.Compare("v"+releaseVer, "v"+util.Ver) <= 0
++	current := util.Ver
++	if qingyuBuildTag != "" {
++		current = qingyuBuildTag
++	}
++	return compareUpdateVersions(releaseVer, current) <= 0
+ }
+ 
+ // skipInstallPkgPlatformCached 缓存平台相关判断，-1 未初始化，0 表示不跳过，1 表示跳过
+@@ -367,6 +380,12 @@ var skipInstallPkgPlatformCached = -1
  
  func skipNewVerInstallPkg() bool {
  	confSystemSnapshot := Conf.LoadSystem()
@@ -37,10 +258,10 @@ index 449ad20..024ec22 100644
  	if skipInstallPkgPlatformCached == -1 {
  		skipInstallPkgPlatformCached = 0
 diff --git a/kernel/model/updater_release.go b/kernel/model/updater_release.go
-index 3a9fd93..535e449 100644
+index 5182836..d964df3 100644
 --- a/kernel/model/updater_release.go
 +++ b/kernel/model/updater_release.go
-@@ -39,8 +39,8 @@ import (
+@@ -27,8 +27,8 @@ import (
  )
  
  const (
@@ -51,7 +272,23 @@ index 3a9fd93..535e449 100644
  	githubAPIReleaseCacheSeconds = int64(6 * 60 * 60)
  	maxChecksumManifestSize      = int64(1024 * 1024)
  )
-@@ -81,9 +81,6 @@ var (
+@@ -46,10 +46,11 @@ type updatePackage struct {
+ }
+ 
+ type githubRelease struct {
+-	TagName string                `json:"tag_name"`
+-	HTMLURL string                `json:"html_url"`
+-	Draft   bool                  `json:"draft"`
+-	Assets  []*githubReleaseAsset `json:"assets"`
++	TagName    string                `json:"tag_name"`
++	HTMLURL    string                `json:"html_url"`
++	Draft      bool                  `json:"draft"`
++	Assets     []*githubReleaseAsset `json:"assets"`
++	Prerelease bool                  `json:"prerelease"`
+ }
+ 
+ type githubReleaseAsset struct {
+@@ -69,9 +70,6 @@ var (
  
  func getUpdateRelease(force bool) (*updateRelease, error) {
  	channel := Conf.System.Load().UpdateChannel
@@ -61,3 +298,42 @@ index 3a9fd93..535e449 100644
  	if !isValidUpdateChannel(channel) {
  		return nil, errors.New("update channel is invalid")
  	}
+@@ -161,6 +159,10 @@ func getGitHubUpdateRelease(channel string, force bool) (*updateRelease, error)
+ 		ReleaseURL: selected.HTMLURL,
+ 		Packages:   map[string]*updatePackage{},
+ 	}
++	if base, _ := qingyuStableVersion(version); base != "" {
++		release.ReleaseURL = qingyuDownloadURL
++		return release, nil
++	}
+ 	if "" == release.ReleaseURL {
+ 		release.ReleaseURL = githubReleaseURLPrefix + version
+ 	}
+@@ -252,7 +254,10 @@ func selectGitHubRelease(releases []*githubRelease, channel string) *githubRelea
+ 		if nil == release || release.Draft || !isReleaseAllowed(channel, release.TagName) {
+ 			continue
+ 		}
+-		if nil == selected || 0 < semver.Compare(normalizeReleaseVersion(release.TagName), normalizeReleaseVersion(selected.TagName)) {
++		if base, _ := qingyuStableVersion(release.TagName); base != "" && release.Prerelease {
++			continue
++		}
++		if nil == selected || 0 < compareUpdateVersions(release.TagName, selected.TagName) {
+ 			selected = release
+ 		}
+ 	}
+@@ -264,11 +269,14 @@ func isReleaseAllowed(channel, version string) bool {
+ 	if !semver.IsValid(normalized) {
+ 		return false
+ 	}
++	if base, _ := qingyuStableVersion(normalized); base != "" {
++		return isValidUpdateChannel(channel)
++	}
+ 	prerelease := strings.TrimPrefix(semver.Prerelease(normalized), "-")
+ 	label := prereleaseChannelLabel(prerelease)
+ 	switch channel {
+ 	case conf.UpdateChannelStable:
+-		return "" == prerelease
++		return false
+ 	case conf.UpdateChannelBeta:
+ 		return "" == prerelease || "beta" == label || "rc" == label
+ 	case conf.UpdateChannelAlpha:

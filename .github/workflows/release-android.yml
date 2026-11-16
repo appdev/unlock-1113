@@ -3,6 +3,10 @@ name: release-android
 on:
   workflow_dispatch:
     inputs:
+      release_tag:
+        description: QingYu Release tag to embed in the client (e.g. v3.8.9-3)
+        type: string
+        required: true
       publish:
         description: Also upload to the draft GitHub Release
         type: boolean
@@ -10,6 +14,7 @@ on:
 
 env:
   VERSION: v3.8.9
+  QINGYU_RELEASE_TAG: ${{ inputs.release_tag }}
   PACKAGE_MANAGER: pnpm@12.6.0
 
 permissions:
@@ -118,7 +123,7 @@ jobs:
 
       - name: Building Android Kernel
         run: |
-          gomobile bind --tags "fts5 sqlcipher" -androidapi 21 -target='android/arm64' -ldflags '-s -w' -v -o "${{ matrix.config.kernel_path }}" ./
+          gomobile bind --tags "fts5 sqlcipher" -androidapi 21 -target='android/arm64' -ldflags "-s -w -X github.com/siyuan-note/siyuan/kernel/model.qingyuBuildTag=$QINGYU_RELEASE_TAG" -v -o "${{ matrix.config.kernel_path }}" ./
           ls -la "${{ matrix.config.kernel_path }}"
         working-directory: ${{ github.workspace }}/siyuan-note/siyuan/kernel/mobile
         env:
@@ -225,4 +230,4 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
-        run: bash scripts/upload-draft-release.sh "$VERSION" artifacts/*
+        run: bash scripts/upload-draft-release.sh "$QINGYU_RELEASE_TAG" artifacts/*

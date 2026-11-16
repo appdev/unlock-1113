@@ -2,6 +2,10 @@ name: Desktop
 on:
   workflow_dispatch:
     inputs:
+      release_tag:
+        description: QingYu Release tag to embed in the client (e.g. v3.8.9-3)
+        type: string
+        required: true
       publish:
         description: Also upload to the draft GitHub Release
         type: boolean
@@ -9,6 +13,7 @@ on:
 
 env:
   VERSION: v3.8.9
+  QINGYU_RELEASE_TAG: ${{ inputs.release_tag }}
   PACKAGE_MANAGER: pnpm@12.6.0
 
 permissions:
@@ -184,7 +189,7 @@ jobs:
         working-directory: ${{ github.workspace }}/siyuan-note/siyuan
 
       - name: Building Kernel
-        run: go build ${{ matrix.config.build_mode }} --tags "fts5 sqlcipher" -o "${{ matrix.config.kernel_path }}" -v -ldflags "${{ matrix.config.build_args }}"
+        run: go build ${{ matrix.config.build_mode }} --tags "fts5 sqlcipher" -o "${{ matrix.config.kernel_path }}" -v -ldflags "${{ matrix.config.build_args }} -X github.com/siyuan-note/siyuan/kernel/model.qingyuBuildTag=$QINGYU_RELEASE_TAG"
         working-directory: ${{ github.workspace }}/siyuan-note/siyuan/kernel
         env:
           GO111MODULE: on
@@ -288,4 +293,4 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
-        run: bash scripts/upload-draft-release.sh "$VERSION" artifacts/*
+        run: bash scripts/upload-draft-release.sh "$QINGYU_RELEASE_TAG" artifacts/*

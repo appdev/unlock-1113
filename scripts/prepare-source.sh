@@ -6,6 +6,16 @@ destination="${1:?Usage: bash scripts/prepare-source.sh <new-directory> [local-u
 upstream="${2:-https://github.com/siyuan-note/siyuan.git}"
 version=v3.8.9
 commit=d3af9d5782082b379d45a69eedf4ebcfe8ba6889
+release_tag="${QINGYU_RELEASE_TAG:-$version}"
+
+if [[ "$release_tag" != "$version" ]]; then
+  revision="${release_tag#"$version"-}"
+  revision="${revision#qingyu.}"
+  if [[ "$release_tag" != "$version"-* || ! "$revision" =~ ^[1-9][0-9]*$ ]]; then
+    echo "Expected $version, $version-<revision>, or $version-qingyu.<revision>." >&2
+    exit 1
+  fi
+fi
 
 if [[ -e "$destination" || -L "$destination" ]]; then
   echo "Source destination already exists: $destination" >&2
