@@ -3400,10 +3400,10 @@ diff --git a/kernel/model/lan_sync.go b/kernel/model/lan_sync.go
  	if conf.ProviderS3 == confSyncSnapshot.Provider {
 diff --git a/kernel/model/managed_storage.go b/kernel/model/managed_storage.go
 new file mode 100644
-index 0000000..a97bf6a
+index 0000000..171a3ec
 --- /dev/null
 +++ b/kernel/model/managed_storage.go
-@@ -0,0 +1,816 @@
+@@ -0,0 +1,822 @@
 +// SiYuan - https://github.com/siyuan-note/siyuan
 +// Copyright (c) 2020-present, b3log.org
 +// SPDX-License-Identifier: AGPL-3.0-or-later
@@ -3469,10 +3469,16 @@ index 0000000..a97bf6a
 +}
 +
 +type managedStorageSubscription struct {
-+	Active        bool   `json:"active"`
-+	EmailVerified bool   `json:"emailVerified"`
-+	ExpiresAt     string `json:"expiresAt"`
-+	QuotaBytes    int64  `json:"quotaBytes"`
++	Active                    bool   `json:"active"`
++	EmailVerified             bool   `json:"emailVerified"`
++	EmailVerificationRequired *bool  `json:"emailVerificationRequired,omitempty"`
++	ExpiresAt                 string `json:"expiresAt"`
++	QuotaBytes                int64  `json:"quotaBytes"`
++}
++
++func (plan managedStorageSubscription) meetsEmailRequirement(user managedStorageUser) bool {
++	return (plan.EmailVerificationRequired != nil && !*plan.EmailVerificationRequired) ||
++		(user.EmailVerified && plan.EmailVerified)
 +}
 +
 +type managedStorageConfig struct {
@@ -3744,7 +3750,7 @@ index 0000000..a97bf6a
 +		return err
 +	}
 +	c.session.User, c.session.Plan = user, plan
-+	if !user.EmailVerified || !plan.EmailVerified {
++	if !plan.meetsEmailRequirement(user) {
 +		c.state = "email_unverified"
 +		return nil
 +	}
@@ -4137,7 +4143,7 @@ index 0000000..a97bf6a
 +	if c.session.Tokens.SessionExpiresAt <= time.Now().Unix() {
 +		return nil, managedError("session_expired")
 +	}
-+	if !c.session.User.EmailVerified {
++	if !c.session.Plan.meetsEmailRequirement(c.session.User) {
 +		return nil, managedError("email_unverified")
 +	}
 +	expires, err := time.Parse(time.RFC3339, c.session.Plan.ExpiresAt)
@@ -4795,10 +4801,10 @@ new file mode 100644
 +}
 diff --git a/kernel/model/managed_storage_test.go b/kernel/model/managed_storage_test.go
 new file mode 100644
-index 0000000..2680d69
+index 0000000..c9b7c8d
 --- /dev/null
 +++ b/kernel/model/managed_storage_test.go
-@@ -0,0 +1,535 @@
+@@ -0,0 +1,543 @@
 +// SiYuan - https://github.com/siyuan-note/siyuan
 +// Copyright (c) 2020-present, b3log.org
 +// SPDX-License-Identifier: AGPL-3.0-or-later
@@ -4828,20 +4834,21 @@ index 0000000..2680d69
 +const fixtureRustFSBucket = "cdp-00000000-0000-0000-0000-000000000001"
 +
 +type managedStorageFixture struct {
-+	mu            sync.Mutex
-+	origin        string
-+	refreshes     int
-+	logouts       int
-+	active        bool
-+	verified      bool
-+	storageBad    bool
-+	offline       bool
-+	invalidTokens bool
-+	repoKey       []byte
-+	repoKeyError  string
-+	repoKeyBad    bool
-+	storageCalls  int
-+	storageTTL    time.Duration
++	mu                        sync.Mutex
++	origin                    string
++	refreshes                 int
++	logouts                   int
++	active                    bool
++	verified                  bool
++	emailVerificationRequired *bool
++	storageBad                bool
++	offline                   bool
++	invalidTokens             bool
++	repoKey                   []byte
++	repoKeyError              string
++	repoKeyBad                bool
++	storageCalls              int
++	storageTTL                time.Duration
 +}
 +
 +func managedStorageTestSetup(t *testing.T) *managedStorageFixture {
@@ -4888,7 +4895,10 @@ index 0000000..2680d69
 +		case "me":
 +			data = managedStorageUser{ID: "fixture-account", Name: "fixture-user", EmailVerified: f.verified}
 +		case "subscription":
-+			data = managedStorageSubscription{Active: f.active, EmailVerified: f.verified, ExpiresAt: time.Now().Add(24 * time.Hour).UTC().Format(time.RFC3339), QuotaBytes: 10_000_000_000}
++			data = managedStorageSubscription{
++				Active: f.active, EmailVerified: f.verified, EmailVerificationRequired: f.emailVerificationRequired,
++				ExpiresAt: time.Now().Add(24 * time.Hour).UTC().Format(time.RFC3339), QuotaBytes: 10_000_000_000,
++			}
 +		case "storage-config":
 +			f.storageCalls++
 +			endpoint := "https://s3api.example"
@@ -5192,17 +5202,21 @@ index 0000000..2680d69
 +	f.verified = false
 +	status, err := LoginManagedStorage(context.Background(), "fixture-user", "synthetic-password", false)
 +	if err != nil || !status.LoggedIn || status.Managed || status.State != "email_unverified" {
-+		t.Fatal("unverified account should stay logged in without replacing source")
++		t.Fatal("legacy server should keep an unverified account logged in without replacing its storage")
 +	}
-+	f.verified, f.active = true, false
++	required := false
++	f.emailVerificationRequired, f.active = &required, false
 +	status = GetManagedStorageStatus(context.Background(), true)
 +	if !status.LoggedIn || status.State != "subscription_required" {
 +		t.Fatal("inactive subscription was treated as login failure")
 +	}
 +	f.active = true
 +	status, err = SetManagedStorageMode(context.Background(), true)
-+	if err != nil || !status.Managed || status.State != "ready" {
++	if err != nil || !status.Managed || status.State != "ready" || status.EmailVerified {
 +		t.Fatalf("renewed service did not provision without login: %v", err)
++	}
++	if s3, err := effectiveManagedStorageS3(); err != nil || s3.Bucket != fixtureRustFSBucket {
++		t.Fatal("server allows storage but the unverified client cannot use it", err)
 +	}
 +}
 +
