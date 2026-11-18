@@ -167,6 +167,16 @@ jobs:
         working-directory: ${{ github.workspace }}/siyuan-note
         run: bash scripts/check-account-free.sh siyuan
 
+      - name: Restore pinned OCR runtime
+        shell: bash
+        working-directory: ${{ github.workspace }}/siyuan-note
+        run: |
+          python_cmd=python3
+          if [[ "${{ runner.os }}" == Windows ]]; then
+            python_cmd=python
+          fi
+          "$python_cmd" scripts/restore-ocr-runtime.py siyuan "${{ matrix.config.goos }}-${{ matrix.config.goarch }}"
+
       - name: Install Node Dependencies
         run: pnpm install --no-frozen-lockfile
         working-directory: ${{ github.workspace }}/siyuan-note/siyuan/app
