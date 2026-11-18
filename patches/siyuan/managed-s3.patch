@@ -988,8 +988,35 @@ diff --git a/app/appearance/langs/zh-TW.json b/app/appearance/langs/zh-TW.json
 +	"managedStorageUsage": "已用容量",
 +	"managedStorageExpires": "服務有效期限至"
  }
+diff --git a/app/src/config/setting/sync.test.ts b/app/src/config/setting/sync.test.ts
+index 3a4de4b..d6ce928 100644
+--- a/app/src/config/setting/sync.test.ts
++++ b/app/src/config/setting/sync.test.ts
+@@ -373,9 +373,11 @@ for (const mobile of [false, true]) {
+             remove: (value: string) => classes.delete(value)};
+         let icon = "#iconCloudSucc";
+         const useElement = {setAttribute: (_name: string, value: string) => { icon = value; }, parentElement: {classList}};
+-        const element = {classList, querySelector: () => useElement, firstElementChild: {classList}};
++        let label = "Sync now";
++        const element = {classList, querySelector: () => useElement, firstElementChild: {classList},
++            getAttribute: () => label, setAttribute: (_name: string, value: string) => { label = value; }};
+         const document = {querySelector: () => mobile ? useElement : element};
+-        const window = {siyuan: {config}};
++        const window = {siyuan: {config, languages: {_kernel: {53: "Sync is disabled"}, syncNow: "Sync now"}}};
+         const systemSource = createSourceFile("processSystem.ts", parse(readFileSync("src/dialog/processSystem.ts", "utf8"),
+             {MOBILE: mobile, BROWSER: mobile}, false, true), ScriptTarget.ES2021, true);
+         const processSync = systemSource.statements.find(statement => isVariableStatement(statement) &&
+@@ -395,6 +397,7 @@ for (const mobile of [false, true]) {
+         await exports.refreshSettingConfig("sync");
+         assert.equal(config.sync.enabled, false);
+         assert.equal(icon, "#iconCloudOff");
++        if (!mobile) assert.equal(label, "Sync is disabled");
+         await exports.refreshSettingConfig("sync");
+         assert.equal(refreshes, 1);
+         icon = "#iconRefresh";
 diff --git a/app/src/config/tabs/managedStorage.test.ts b/app/src/config/tabs/managedStorage.test.ts
 new file mode 100644
+index 0000000..ee55351
 --- /dev/null
 +++ b/app/src/config/tabs/managedStorage.test.ts
 @@ -0,0 +1,92 @@
@@ -1041,10 +1068,10 @@ new file mode 100644
 +                requests.push({url, data});
 +                if (url.endsWith("getManagedStorageStatus")) return {code: 0, data: signedOut};
 +                if (url.endsWith("loginManagedStorage") && rejectLogin) return {code: -1, msg: "login_failed"};
-+                if (url.endsWith("loginManagedStorage")) config.sync.enabled = true;
 +                if (url.endsWith("setManagedStorageMode")) { ready.syncEnabled = true; ready.syncPending = false; }
 +                return {code: 0, data: ready};
 +            }};
++            if (name === "../../dialog/processSystem") return {processSync() {}};
 +            return {};
 +        },
 +    });
@@ -1087,12 +1114,14 @@ new file mode 100644
 +});
 diff --git a/app/src/config/tabs/managedStorage.ts b/app/src/config/tabs/managedStorage.ts
 new file mode 100644
+index 0000000..8ac521f
 --- /dev/null
 +++ b/app/src/config/tabs/managedStorage.ts
-@@ -0,0 +1,269 @@
+@@ -0,0 +1,267 @@
 +import {fetchSyncPost} from "../../util/fetch";
 +import {escapeHtmlTextAndAttr} from "../../util/escape";
 +import {confirmDialog} from "../../dialog/confirmDialog";
++import {processSync} from "../../dialog/processSystem";
 +import type {APIPOSTRoutes, APITransportError, ManagedStorageStatus} from "../../types/api";
 +
 +type ActionResult = APIPOSTRoutes["/api/sync/loginManagedStorage"]["response"] | APITransportError;
@@ -1168,11 +1197,14 @@ new file mode 100644
 +        status = next;
 +        if (next.syncPending && next.loggedIn) pendingSyncStarts.set(root, next.accountId);
 +        else pendingSyncStarts.delete(root);
-+        window.siyuan.config.sync.managedStorage = next.managed;
++        const sync = window.siyuan.config.sync;
++        sync.managedStorage = next.managed;
 +        if (next.managed) {
-+            window.siyuan.config.sync.enabled = next.syncEnabled;
++            const changed = sync.enabled !== next.syncEnabled;
++            sync.enabled = next.syncEnabled;
 +            const toggle = root.querySelector<HTMLInputElement>('[id="sync.enabled"]');
 +            if (toggle) toggle.checked = next.syncEnabled;
++            if (changed) processSync();
 +        }
 +        root.querySelector("#syncProviderConfigRow")?.classList.toggle("fn__none", next.managed);
 +    };
@@ -1277,9 +1309,6 @@ new file mode 100644
 +            if (!mounted()) return;
 +            if (response.code === 0) {
 +                pendingSyncStarts.delete(root);
-+                window.siyuan.config.sync.enabled = true;
-+                const toggle = root.querySelector<HTMLInputElement>('[id="sync.enabled"]');
-+                if (toggle) toggle.checked = true;
 +                updateStatus(response.data);
 +            } else {
 +                error = errorText(response.msg);
@@ -1312,9 +1341,6 @@ new file mode 100644
 +                updateStatus(response.data);
 +                if (response.data.syncPending) {
 +                    await maybeStartSync();
-+                }
-+                if (!response.data.loggedIn && response.data.managed) {
-+                    window.siyuan.config.sync.enabled = false;
 +                }
 +                onChange();
 +            } else {
@@ -1603,6 +1629,69 @@ diff --git a/app/src/config/tabs/syncUi.ts b/app/src/config/tabs/syncUi.ts
      }
  };
  
+diff --git a/app/src/dialog/processSystem.ts b/app/src/dialog/processSystem.ts
+index 22c88de..17f1c80 100644
+--- a/app/src/dialog/processSystem.ts
++++ b/app/src/dialog/processSystem.ts
+@@ -431,11 +431,17 @@ export const processSync = (data?: IWebSocketData) => {
+         return;
+     }
+     const useElement = iconElement.querySelector("use");
++    const languages = window.siyuan.languages;
++    const disabledLabel = languages._kernel[53];
+     if (!data) {
+         if (iconElement.classList.contains("toolbar__item--active")) {
+             // 同步进行中时保持旋转状态，待同步完成后由同步结果消息更新图标 https://github.com/siyuan-note/siyuan/issues/18597
+             return;
+         }
++        const currentLabel = iconElement.getAttribute("aria-label");
++        if (syncDisabled || !currentLabel || currentLabel === disabledLabel) {
++            iconElement.setAttribute("aria-label", syncDisabled ? disabledLabel : languages.syncNow);
++        }
+         iconElement.classList.remove("toolbar__item--active");
+         useElement.setAttribute("xlink:href", syncDisabled ? "#iconCloudOff" : "#iconCloudSucc");
+         return;
+@@ -445,12 +451,11 @@ export const processSync = (data?: IWebSocketData) => {
+         iconElement.classList.add("toolbar__item--active");
+         iconElement.firstElementChild.classList.add("fn__rotate");
+         useElement.setAttribute("xlink:href", "#iconRefresh");
+-    } else if (data.code === 2) {    // error
++        iconElement.setAttribute("aria-label", data.msg || languages._kernel[81]);
++    } else if (data.code === 1 || data.code === 2) {
+         iconElement.classList.remove("toolbar__item--active");
+-        useElement.setAttribute("xlink:href", syncDisabled ? "#iconCloudOff" : "#iconCloudError");
+-    } else if (data.code === 1) {   // success
+-        iconElement.classList.remove("toolbar__item--active");
+-        useElement.setAttribute("xlink:href", syncDisabled ? "#iconCloudOff" : "#iconCloudSucc");
++        useElement.setAttribute("xlink:href", syncDisabled ? "#iconCloudOff" : (data.code === 2 ? "#iconCloudError" : "#iconCloudSucc"));
++        iconElement.setAttribute("aria-label", syncDisabled ? disabledLabel : (data.msg || languages.syncNow));
+     }
+     /// #endif
+     if (data.code === 0) {
+diff --git a/app/src/layout/topBar.ts b/app/src/layout/topBar.ts
+index 0d9562f..88716ae 100644
+--- a/app/src/layout/topBar.ts
++++ b/app/src/layout/topBar.ts
+@@ -325,10 +325,18 @@ ${isInMobileApp() ? `<div id="barExit" data-topbar-entry="barExit" class="ft__er
+         event.stopPropagation();
+         event.preventDefault();
+         fetchPost("/api/sync/getSyncInfo", {}, (response) => {
++            if (barSyncElement.classList.contains("toolbar__item--active")) {
++                return;
++            }
++            const disabledLabel = window.siyuan.languages._kernel[53];
+             let html = "";
+             if (!window.siyuan.config.sync.enabled || (0 === window.siyuan.config.sync.provider && needSubscribe(""))) {
+-                html = response.data.stat;
++                html = disabledLabel;
+             } else {
++                // 响应可能来自启用同步之前，不能用旧状态覆盖工具栏。
++                if (response.data.stat === disabledLabel) {
++                    return;
++                }
+                 html = window.siyuan.languages._kernel[82].replace("%s", dayjs(response.data.synced).format("YYYY-MM-DD HH:mm")) + "<br>";
+                 html += "&emsp;" + response.data.stat;
+                 if (response.data.kernels.length > 0) {
 diff --git a/app/src/sync/syncGuide.ts b/app/src/sync/syncGuide.ts
 --- a/app/src/sync/syncGuide.ts
 +++ b/app/src/sync/syncGuide.ts

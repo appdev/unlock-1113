@@ -20,7 +20,7 @@ index e824aba..b49d972 100644
 +            body: JSON.stringify({showMsg: true}),
 +        }).then((response) => {
 +            const downloadURL = response.headers.get("X-QingYu-Update-URL");
-+            if (response.ok && downloadURL === "https://sy.apkdv.com/download") {
++            if (response.ok && downloadURL === "https://qynotes.com/download") {
 +                openLink(window.siyuan.ws.app, downloadURL);
 +            }
 +        }).catch((error: Error) => {
@@ -72,7 +72,7 @@ index 0000000..5db45a3
 +	"golang.org/x/mod/semver"
 +)
 +
-+const qingyuDownloadURL = "https://sy.apkdv.com/download"
++const qingyuDownloadURL = "https://qynotes.com/download"
 +
 +// Set by the release workflows. Local builds without a tag fall back to the upstream version.
 +var qingyuBuildTag string
@@ -146,7 +146,7 @@ index 0000000..17c0334
 +	if err != nil {
 +		t.Fatal(err)
 +	}
-+	if release.Version != "3.8.9-qingyu.2" || release.ReleaseURL != "https://sy.apkdv.com/download" || len(release.Packages) != 0 {
++	if release.Version != "3.8.9-qingyu.2" || release.ReleaseURL != "https://qynotes.com/download" || len(release.Packages) != 0 {
 +		t.Fatalf("unexpected stable QingYu release: %+v", release)
 +	}
 +

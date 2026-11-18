@@ -59,3 +59,72 @@ runInNewContext(`${renderSource}\nrenderProviderConfig(root);`, {...syncContext}
 assert.match(panel.innerHTML, /LOGIN_REQUIRED/, 'Control case must detect the reported missing-user regression');
 assert.equal(configRow.innerHTML, '', 'Missing-user control must hide the provider configuration row');
 console.log('PASS: S3/WebDAV configuration renders for local unlock state; missing-user control is blocked');
+
+const syncSource = load('app/src/dialog/processSystem.ts');
+const processStart = syncSource.indexOf('const processSync =');
+const processEnd = syncSource.indexOf('\nconst ', processStart + 1);
+const syncRenderer = syncSource.slice(processStart, processEnd === -1 ? undefined : processEnd)
+    .replace(/\/\/\/ #if MOBILE[\s\S]*?\/\/\/ #else/, '').replace('/// #endif', '');
+const toolbar = () => {
+    const classes = new Set();
+    const attributes = new Map();
+    return {
+        classList: {
+            add: name => classes.add(name),
+            remove: name => classes.delete(name),
+            contains: name => classes.has(name),
+        },
+        getAttribute: name => attributes.get(name) ?? null,
+        setAttribute: (name, value) => attributes.set(name, value),
+    };
+};
+const button = toolbar();
+const icon = toolbar();
+button.firstElementChild = toolbar();
+button.querySelector = selector => selector === 'use' ? icon : null;
+button.setAttribute('aria-label', '数据同步尚未启用');
+icon.setAttribute('xlink:href', '#iconCloudOff');
+const sync = {provider: 2, managedStorage: true, enabled: false};
+const fields = {username: {value: 'test-user'}, password: {value: 'test-password'}, remember: {checked: false}};
+let submitLogin;
+const form = {querySelector: selector => fields[selector.slice(7, -2)],
+    addEventListener: (event, listener) => { if (event === 'submit') submitLogin = listener; }};
+const storagePanel = {isConnected: true, querySelector: () => form, querySelectorAll: () => []};
+const toggle = {checked: false};
+const settings = {querySelector: selector => selector === '[data-managed-storage]' ? storagePanel :
+    selector === '[id="sync.enabled"]' ? toggle : null};
+const signedOut = {configured: true, managed: true, loggedIn: false, syncEnabled: false, state: 'signed_out'};
+const enabled = {...signedOut, loggedIn: true, syncEnabled: true, state: 'ready'};
+const messages = {disabled: '数据同步尚未启用', ready: '立即同步', syncing: '正在同步', done: '同步完成'};
+const actions = runInNewContext(`${syncRenderer}\n${load('app/src/config/tabs/managedStorage.ts')}\n({mountManagedStorage, processSync})`, {
+    AbortController, CustomEvent, MutationObserver: class { observe() {} },
+    window: {siyuan: {config: {sync}, languages: {
+        _kernel: {53: messages.disabled, 81: messages.syncing}, syncNow: messages.ready,
+    }}, dispatchEvent() {}},
+    document: {body: {}, querySelector: selector => selector === '#barSync' ? button : null},
+    escapeHtmlTextAndAttr: text => String(text ?? ''),
+    emitToPlugins() {},
+    fetchSyncPost: async path => ({code: 0, data: path.endsWith('loginManagedStorage') ? enabled : signedOut}),
+});
+actions.mountManagedStorage(settings, () => {});
+const settle = () => new Promise(resolve => setImmediate(resolve));
+await settle();
+submitLogin({preventDefault() {}, currentTarget: form});
+await settle();
+assert.equal(toggle.checked, true);
+assert.equal(button.getAttribute('aria-label'), messages.ready, 'Successful first sign-in must clear the disabled tooltip immediately');
+assert.equal(icon.getAttribute('xlink:href'), '#iconCloudSucc');
+actions.processSync({code: 0, msg: messages.syncing});
+assert.equal(button.getAttribute('aria-label'), messages.syncing);
+assert.ok(button.firstElementChild.classList.contains('fn__rotate'));
+actions.processSync();
+assert.equal(icon.getAttribute('xlink:href'), '#iconRefresh', 'Refreshing settings must preserve an in-progress sync');
+actions.processSync({code: 1, msg: messages.done});
+assert.equal(button.getAttribute('aria-label'), messages.done);
+assert.equal(icon.getAttribute('xlink:href'), '#iconCloudSucc');
+assert.equal(button.firstElementChild.classList.contains('fn__rotate'), false);
+sync.enabled = false;
+actions.processSync();
+assert.equal(button.getAttribute('aria-label'), messages.disabled);
+assert.equal(icon.getAttribute('xlink:href'), '#iconCloudOff');
+console.log('PASS: first sign-in updates the sync toolbar before upload, and sync messages keep it current');
